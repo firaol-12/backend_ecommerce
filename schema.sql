@@ -285,3 +285,5 @@ CREATE TRIGGER trigger_coupons_updated_at
 BEFORE UPDATE ON coupons
 FOR EACH ROW
 EXECUTE FUNCTION set_updated_at();
+
+
