@@ -82,11 +82,14 @@ async function createOrderFromCart(userId, body) {
     throw err;
   }
 
+  // Note: shipping and billing may be the same address, so compare the count
+  // of DISTINCT ids rather than raw rows (IN (5, 5) returns one row).
+  const addressIds = [...new Set([Number(shipping_address_id), Number(billing_address_id)])];
   const addrResult = await query(
-    'SELECT id, address_type FROM addresses WHERE id IN ($1, $2) AND user_id = $3',
-    [shipping_address_id, billing_address_id, userId]
+    'SELECT id FROM addresses WHERE id = ANY($1::int[]) AND user_id = $2',
+    [addressIds, userId]
   );
-  if (addrResult.rowCount !== 2) {
+  if (addrResult.rowCount !== addressIds.length) {
     const err = new Error('Invalid shipping or billing address.');
     err.status = 400;
     throw err;
@@ -282,19 +285,39 @@ router.post('/chapa/initialize', requireAuth, async (req, res) => {
   let orderRef;
   let totalAmount = 0;
   let txRef;
-  try {
-    const { shipping_address_id, billing_address_id, shipping_method, notes, coupon_code } = req.body;
-    const userId = req.user.userId;
+  const { shipping_address_id, billing_address_id, shipping_method, notes, coupon_code, tx_ref: existingTxRef } = req.body || {};
+  const userId = req.user.userId;
 
+  try {
+    if (existingTxRef) {
+      // Resume flow: /chapa/order already created the order (and cleared the
+      // cart). Reuse that pending payment instead of creating a duplicate —
+      // re-creating would fail with "Cart is empty".
+      const existing = await query(
+        `SELECT p.transaction_id, p.amount, o.id AS order_id, o.order_number, o.payment_status
+         FROM payments p JOIN orders o ON o.id = p.order_id
+         WHERE p.transaction_id = $1 AND o.user_id = $2`,
+        [existingTxRef, userId]
+      );
+      if (existing.rowCount === 0 || existing.rows[0].payment_status !== 'pending') {
+        return res.status(404).json({ message: 'No pending payment found for this tx_ref.' });
+      }
+      txRef = existing.rows[0].transaction_id;
+      totalAmount = Number(existing.rows[0].amount);
+      orderRef = { id: existing.rows[0].order_id, order_number: existing.rows[0].order_number, total_amount: totalAmount };
+    } else {
     if (!shipping_address_id || !billing_address_id) {
       return res.status(400).json({ message: 'shipping_address_id and billing_address_id are required.' });
     }
 
+    // Note: shipping and billing may be the same address, so compare the count
+    // of DISTINCT ids rather than raw rows (IN (5, 5) returns one row).
+    const addressIds = [...new Set([Number(shipping_address_id), Number(billing_address_id)])];
     const addrResult = await query(
-      'SELECT id, address_type FROM addresses WHERE id IN ($1, $2) AND user_id = $3',
-      [shipping_address_id, billing_address_id, userId]
+      'SELECT id FROM addresses WHERE id = ANY($1::int[]) AND user_id = $2',
+      [addressIds, userId]
     );
-    if (addrResult.rowCount !== 2) {
+    if (addrResult.rowCount !== addressIds.length) {
       return res.status(400).json({ message: 'Invalid shipping or billing address.' });
     }
 
@@ -342,6 +365,7 @@ router.post('/chapa/initialize', requireAuth, async (req, res) => {
 
     await client.query('DELETE FROM cart WHERE user_id = $1', [userId]);
     await client.query('COMMIT');
+    } // end of else (new-order-from-cart branch)
   } catch (error) {
     if (client) {
       try { await client.query('ROLLBACK'); } catch (_) { /* connection may already be closed */ }
