@@ -10,8 +10,13 @@ const MAX_IMAGE_LENGTH = 3000000; // characters (~2 MB of decoded image data)
 
 router.get('/', async (req, res) => {
   try {
-    const { categoryId, search, minPrice, maxPrice, sort = 'newest', page = 1, limit = 12 } = req.query;
+    const { categoryId, search, minPrice, maxPrice, sort = 'newest', page = 1, limit = 12, includeInactive } = req.query;
     const { offset, limit: pageLimit } = buildPagination(page, limit);
+
+    // The storefront only ever sees active products. The dashboard passes
+    // includeInactive=true so admins can still see (and reactivate) products
+    // that were soft-deleted because they belong to past orders.
+    const showInactive = includeInactive === 'true' || includeInactive === '1';
 
     let sql = `
       SELECT p.*, c.name AS category_name,
@@ -19,8 +24,13 @@ router.get('/', async (req, res) => {
              COALESCE((SELECT pi.image_url FROM product_images pi WHERE pi.product_id = p.id AND pi.is_main_image = TRUE LIMIT 1), '') AS image_url
       FROM products p
       LEFT JOIN categories c ON c.id = p.category_id
-      WHERE p.is_active = TRUE
+      WHERE TRUE
     `;
+
+    if (!showInactive) {
+      sql += ` AND p.is_active = TRUE`;
+    }
+
     const params = [];
     let paramIndex = 1;
 
@@ -278,8 +288,37 @@ router.delete('/:id', requireAuth, requireAdmin, async (req, res) => {
     if (result.rowCount === 0) {
       return res.status(404).json({ message: 'Product not found.' });
     }
-    return res.json({ message: 'Product deleted successfully' });
+    return res.json({ message: 'Product deleted successfully', deactivated: false });
   } catch (error) {
+    // order_items.product_id references products WITHOUT ON DELETE CASCADE on
+    // purpose (past orders must keep their snapshots). A product that has been
+    // ordered therefore cannot be hard-deleted; deactivate it instead so it
+    // disappears from the store but its order history stays intact.
+    if (error && error.code === '23503') {
+      try {
+        const deactivated = await query(
+          `UPDATE products
+           SET is_active = FALSE, updated_at = NOW()
+           WHERE id = $1
+           RETURNING *`,
+          [req.params.id]
+        );
+        if (deactivated.rowCount === 0) {
+          return res.status(404).json({ message: 'Product not found.' });
+        }
+        return res.json({
+          message:
+            'This product is part of past orders, so it was deactivated (hidden from the store) instead of being permanently deleted. You can reactivate it from the Edit form.',
+          deactivated: true,
+          product: deactivated.rows[0],
+        });
+      } catch (deactivateError) {
+        return res.status(500).json({
+          message: 'Failed to delete product',
+          error: deactivateError.message,
+        });
+      }
+    }
     return res.status(500).json({ message: 'Failed to delete product', error: error.message });
   }
 });

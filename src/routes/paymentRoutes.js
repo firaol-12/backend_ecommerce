@@ -24,12 +24,32 @@ function generateOrderNumber() {
   return `ORD-${timestamp}-${random}`;
 }
 
-// If Chapa setup fails after the order was committed, restore stock and mark
-// the order as failed so the customer can retry without inventory loss.
+// If Chapa setup fails after the order was committed, undo the reservation:
+// restore product stock, put the items back into the customer's cart, and mark
+// the order as failed. Runs in a transaction and is safe to call more than
+// once — the work only happens while the order is still 'pending', so a
+// repeated call (e.g. the frontend retrying cancel) can never double-restore
+// stock or duplicate cart rows, and an already-paid order is never voided.
 async function voidFailedOrder(orderId) {
   if (!orderId) return;
+  let client;
   try {
-    await query(
+    client = await pool.connect();
+    await client.query('BEGIN');
+
+    // Flip pending -> failed first; if the row isn't pending anymore the
+    // rowCount is 0 and nothing below runs (idempotency + payment guard).
+    const voided = await client.query(
+      `UPDATE orders SET payment_status = 'failed', updated_at = NOW()
+       WHERE id = $1 AND payment_status = 'pending'`,
+      [orderId]
+    );
+    if (voided.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return;
+    }
+
+    await client.query(
       `UPDATE products SET stock = stock + q.restored
        FROM (
          SELECT product_id, SUM(quantity) AS restored
@@ -38,11 +58,34 @@ async function voidFailedOrder(orderId) {
        WHERE products.id = q.product_id`,
       [orderId]
     );
-    await query(
-      `UPDATE orders SET payment_status = 'failed', updated_at = NOW() WHERE id = $1`,
+
+    // Put the items back into the cart so the customer can retry the payment
+    // without re-adding everything by hand. The cart keeps a UNIQUE
+    // (user_id, product_id), so merge into an existing row if one appeared
+    // again in the meantime. (order_items has no user_id — it comes from the
+    // joined order.)
+    await client.query(
+      `INSERT INTO cart (user_id, product_id, quantity)
+       SELECT o.user_id, oi.product_id, SUM(oi.quantity)
+       FROM order_items oi
+       JOIN orders o ON o.id = oi.order_id
+       WHERE oi.order_id = $1
+       GROUP BY o.user_id, oi.product_id
+       ON CONFLICT (user_id, product_id)
+       DO UPDATE SET quantity = cart.quantity + EXCLUDED.quantity,
+                     updated_at = NOW()`,
       [orderId]
     );
-  } catch (_) { /* best-effort cleanup */ }
+
+    await client.query('COMMIT');
+  } catch (error) {
+    if (client) {
+      try { await client.query('ROLLBACK'); } catch (_) { /* connection may already be closed */ }
+    }
+    console.error('[payments] Failed to void order', orderId, error.message);
+  } finally {
+    if (client) client.release();
+  }
 }
 
 // Chapa's error "message" may be a plain string or a validation object.
@@ -55,19 +98,41 @@ function stringifyGatewayMessage(data) {
   return 'unknown error';
 }
 
-// Build a Chapa-safe email: Chapa rejects test/disposable domains (e.g.
-// @test.com). Uses the customer's email if it looks real, otherwise CHAPA_TEST_EMAIL.
+// Build a Chapa-safe email. Chapa uses Laravel-style email validation and
+// REJECTS placeholder/reserved domains (example.com, test.com, ...) with
+// {"email":["validation.email"]} even though they are syntactically valid.
+// Use the customer's email only if its DOMAIN is not one of those; otherwise
+// fall back to CHAPA_TEST_EMAIL (a real email the developer sets for testing).
 function resolveChapaEmail(customer) {
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   const customerEmail = String(customer.email || '').trim().toLowerCase();
-  const isValidRealEmail = emailRegex.test(customerEmail) &&
-    !/(^|\.)(test|example|sample|dummy|fake|none|unknown)\./i.test(customerEmail) &&
-    !customerEmail.endsWith('@test.com');
-  const email = isValidRealEmail ? customerEmail : (CHAPA_TEST_EMAIL || customerEmail);
-  if (!emailRegex.test(email)) {
-    throw new Error('Chapa requires a valid customer email. Set CHAPA_TEST_EMAIL to a real email for testing.');
+
+  // Validate the DOMAIN part explicitly — a naive substring check misses
+  // addresses like admin@example.com because "example" follows "@".
+  const domain = customerEmail.split('@')[1] || '';
+  const rejectedDomains = new Set([
+    'test.com', 'test.org', 'test.net',
+    'example.com', 'example.org', 'example.net',
+    'mailinator.com', 'yopmail.com', 'guerrillamail.com', '10minutemail.com',
+  ]);
+  const isRejectedDomain =
+    rejectedDomains.has(domain) ||
+    /\.(test|example)\./i.test(domain) || // subdomains like mail.example.com
+    /\.(test|example)$/i.test(domain); // TLD-style: host.example
+
+  const isValidRealEmail = emailRegex.test(customerEmail) && !isRejectedDomain;
+  const fallbackEmail = String(CHAPA_TEST_EMAIL || '').trim().toLowerCase();
+
+  if (!isValidRealEmail) {
+    if (!emailRegex.test(fallbackEmail)) {
+      throw new Error(
+        'Chapa rejects placeholder emails (e.g. test.com / example.com). Set CHAPA_TEST_EMAIL in the backend .env to a real email address to allow payments for demo accounts.'
+      );
+    }
+    return fallbackEmail;
   }
-  return email;
+
+  return customerEmail;
 }
 
 // Creates an order from the user's cart, records a pending Chapa payment and
@@ -381,18 +446,10 @@ router.post('/chapa/initialize', requireAuth, async (req, res) => {
     const userResult = await query('SELECT first_name, last_name, email, phone FROM users WHERE id = $1', [userId]);
     const customer = userResult.rows[0] || {};
 
-    // Chapa rejects test/disposable domains (e.g. @test.com). Build a safe email:
-    // use the customer's email if it looks real, otherwise fall back to the
-    // CHAPA_TEST_EMAIL override (set it to a real email for local testing).
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    const customerEmail = String(customer.email || '').trim().toLowerCase();
-    const isValidRealEmail = emailRegex.test(customerEmail) &&
-      !/(^|\.)(test|example|sample|dummy|fake|none|unknown)\./i.test(customerEmail) &&
-      !customerEmail.endsWith('@test.com');
-    const email = isValidRealEmail ? customerEmail : (CHAPA_TEST_EMAIL || customerEmail);
-    if (!emailRegex.test(email)) {
-      throw new Error('Chapa requires a valid customer email. Set CHAPA_TEST_EMAIL to a real email for testing.');
-    }
+    // Chapa rejects placeholder domains (test.com, example.com, ...). Build a
+    // Chapa-safe email: the customer's real email, or the CHAPA_TEST_EMAIL
+    // fallback for demo accounts (see resolveChapaEmail).
+    const email = resolveChapaEmail(customer);
 
     const init = await chapaRequest('/v1/transaction/initialize', {
       method: 'POST',
@@ -486,22 +543,28 @@ router.post('/chapa/order', requireAuth, async (req, res) => {
   }
 });
 
-// Cancel a pending order created for the embedded modal if the customer never
-// reached the payment form (e.g. Chapa.js could not load). Restores stock.
+// Cancel a pending order if the customer never reached the payment form
+// (e.g. a connection problem between the browser and Chapa). Restores stock
+// AND the cart items so the customer can retry immediately.
 router.post('/chapa/cancel', requireAuth, async (req, res) => {
   try {
     const { tx_ref } = req.body || {};
     if (!tx_ref) return res.status(400).json({ message: 'tx_ref is required.' });
     const payResult = await query(
-      `SELECT p.order_id, o.user_id FROM payments p JOIN orders o ON o.id = p.order_id
+      `SELECT p.order_id, p.status, o.user_id FROM payments p JOIN orders o ON o.id = p.order_id
        WHERE p.transaction_id = $1 AND o.user_id = $2`,
       [tx_ref, req.user.userId]
     );
     if (payResult.rowCount === 0) {
       return res.status(404).json({ message: 'Order not found.' });
     }
+    if (payResult.rows[0].status === 'completed') {
+      // Never void an order the customer already paid for (e.g. a late retry
+      // of cancel racing with a successful webhook).
+      return res.status(409).json({ message: 'This order was already paid and cannot be cancelled.' });
+    }
     await voidFailedOrder(payResult.rows[0].order_id);
-    return res.json({ message: 'Order cancelled.' });
+    return res.json({ message: 'Order cancelled.', cart_restored: true });
   } catch (error) {
     return res.status(500).json({ message: 'Failed to cancel order', error: error.message });
   }
@@ -532,7 +595,18 @@ router.get('/chapa/verify/:txRef', requireAuth, async (req, res) => {
 
     const result = await chapaRequest(`/v1/transaction/verify/${encodeURIComponent(txRef)}`);
     const gatewayStatus = result.data && result.data.data ? result.data.data.status : '';
-    const dbStatus = paymentStatusFromChapa(result.ok ? gatewayStatus : 'failed');
+    // If we could not reach Chapa at all (network problem), do NOT guess:
+    // leave the payment 'pending' so it can be re-verified or settled by the
+    // webhook. Marking it 'failed' here would wrongly void orders whose
+    // payment may actually have succeeded.
+    const dbStatus = result.ok ? paymentStatusFromChapa(gatewayStatus) : 'pending';
+
+    if (result.ok && dbStatus === 'failed') {
+      // Chapa explicitly reported failure/cancellation — give the stock and
+      // cart back (voidFailedOrder is a no-op if the order was already voided
+      // or has since been paid).
+      await voidFailedOrder(paymentRow.order_id);
+    }
 
     await query(
       `UPDATE payments SET status = $1, payment_gateway_response = $2, updated_at = NOW() WHERE id = $3`,
@@ -582,6 +656,19 @@ router.post('/chapa/webhook', async (req, res) => {
       const vStatus = verifyResult.data && verifyResult.data.data ? verifyResult.data.data.status : '';
       if (vStatus) dbStatus = paymentStatusFromChapa(vStatus);
     } catch (_) { /* keep webhook-derived status if verification fails */ }
+
+    if (dbStatus === 'failed') {
+      // The payment definitively failed — restore the stock and cart the order
+      // reserved. voidFailedOrder only runs while the order is still pending,
+      // so this is safe even if the verify endpoint already voided it.
+      const failedPayment = await query(
+        'SELECT order_id FROM payments WHERE transaction_id = $1 LIMIT 1',
+        [txRef]
+      );
+      if (failedPayment.rowCount > 0) {
+        await voidFailedOrder(failedPayment.rows[0].order_id);
+      }
+    }
 
     await query(
       `UPDATE payments SET status = $1, payment_gateway_response = $2, updated_at = NOW() WHERE transaction_id = $3`,
